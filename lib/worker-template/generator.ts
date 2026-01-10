@@ -45,6 +45,7 @@ function generatePackageJson(workerName: string): string {
       next: '16.1.1',
       react: '19.0.0',
       'react-dom': '19.0.0',
+      'workflow': '4.0.1-beta.44',
     },
     devDependencies: {
       '@types/node': '^22',
@@ -55,13 +56,15 @@ function generatePackageJson(workerName: string): string {
 }
 
 /**
- * Generate next.config.js
+ * Generate next.config.ts with workflow plugin
  */
 function generateNextConfig(): string {
-  return `/** @type {import('next').NextConfig} */
-const nextConfig = {};
+  return `import { withWorkflow } from "workflow/next";
+import type { NextConfig } from "next";
 
-module.exports = nextConfig;
+const nextConfig: NextConfig = {};
+
+export default withWorkflow(nextConfig);
 `;
 }
 
@@ -97,14 +100,46 @@ function generateTsConfig(): string {
  * This wraps user code and exposes functions via /api/invoke/[fn]
  */
 function generateApiRoute(userCode: string, functionNames: string[]): string {
+  // Generate step-wrapped versions of each user function for automatic retries
+  const stepFunctions = functionNames.map(fn => `
+// Step-wrapped version of ${fn} - gets automatic retries and durability
+async function ${fn}Step(payload: any) {
+  "use step";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return await (${fn} as any)(payload);
+}
+`).join('\n');
+
   return `import { NextRequest, NextResponse } from 'next/server';
+
+// Capture console.log output
+const capturedLogs: { timestamp: number; level: string; message: string }[] = [];
+const originalLog = console.log;
+const originalError = console.error;
+const originalWarn = console.warn;
+
+function captureLog(level: string, ...args: any[]) {
+  const message = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  capturedLogs.push({ timestamp: Date.now(), level, message });
+  // Also send to real console
+  if (level === 'error') originalError(...args);
+  else if (level === 'warn') originalWarn(...args);
+  else originalLog(...args);
+}
+
+console.log = (...args) => captureLog('info', ...args);
+console.error = (...args) => captureLog('error', ...args);
+console.warn = (...args) => captureLog('warn', ...args);
 
 // User code
 ${userCode}
 
-// Function registry
+// Step-wrapped functions with automatic retries and durability
+${stepFunctions}
+
+// Function registry mapping to step-wrapped versions
 const functions: Record<string, (payload: any) => Promise<any>> = {
-${functionNames.map(fn => `  '${fn}': ${fn},`).join('\n')}
+${functionNames.map(fn => `  '${fn}': ${fn}Step,`).join('\n')}
 };
 
 export async function POST(
@@ -121,22 +156,28 @@ export async function POST(
     );
   }
 
+  // Clear captured logs for this request
+  capturedLogs.length = 0;
+
   try {
     const payload = await request.json().catch(() => ({}));
 
     console.log(\`[INVOKE] Function: \${fn}, Payload: \${JSON.stringify(payload)}\`);
 
     const startTime = Date.now();
+    // Execute the workflow - gets automatic retries, durability, observability
     const result = await func(payload);
     const duration = Date.now() - startTime;
 
-    console.log(\`[RESULT] Function: \${fn}, Duration: \${duration}ms, Result: \${JSON.stringify(result)}\`);
+    console.log(\`[RESULT] Function: \${fn}, Duration: \${duration}ms\`);
 
     return NextResponse.json({
       success: true,
       function: fn,
       result,
       duration,
+      durable: true,
+      logs: [...capturedLogs],  // Return captured logs
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -147,6 +188,7 @@ export async function POST(
         success: false,
         function: fn,
         error: message,
+        logs: [...capturedLogs],  // Return captured logs even on error
       },
       { status: 500 }
     );
@@ -165,6 +207,7 @@ export async function GET(
     function: fn,
     available: fn in functions,
     allFunctions: Object.keys(functions),
+    durable: true,
     timestamp: new Date().toISOString(),
   });
 }
@@ -227,7 +270,7 @@ export function generateWorkerFiles(
       data: generatePackageJson(workerName),
     },
     {
-      file: 'next.config.js',
+      file: 'next.config.ts',
       data: generateNextConfig(),
     },
     {

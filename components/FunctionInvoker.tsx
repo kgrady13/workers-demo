@@ -5,18 +5,25 @@ import { useState, useEffect } from 'react';
 interface Worker {
   id: string;
   name: string;
-  tenantId: string;
+  deploymentId: string;
+  deploymentUrl: string;
   status: 'building' | 'ready' | 'error';
   functions: string[];
-  vercelDeploymentUrl: string | null;
   errorMessage: string | null;
+}
+
+interface LogEntry {
+  timestamp: number;
+  level: string;
+  message: string;
 }
 
 interface FunctionInvokerProps {
   worker: Worker;
+  onLogs?: (logs: LogEntry[]) => void;
 }
 
-export default function FunctionInvoker({ worker }: FunctionInvokerProps) {
+export default function FunctionInvoker({ worker, onLogs }: FunctionInvokerProps) {
   const [selectedFunction, setSelectedFunction] = useState('');
   const [payload, setPayload] = useState('{}');
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
@@ -67,6 +74,11 @@ export default function FunctionInvoker({ worker }: FunctionInvokerProps) {
       }
 
       setResult(data);
+
+      // Pass logs to parent if available
+      if (data.logs && onLogs) {
+        onLogs(data.logs);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Invocation failed');
       setDuration(Date.now() - startTime);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import WorkerList from "@/components/WorkerList";
 import CodeEditor from "@/components/CodeEditor";
 import FunctionInvoker from "@/components/FunctionInvoker";
@@ -9,16 +9,18 @@ import LogViewer from "@/components/LogViewer";
 interface Worker {
   id: string;
   name: string;
-  tenantId: string;
+  deploymentId: string;
+  deploymentUrl: string;
   status: "building" | "ready" | "error";
   functions: string[];
-  vercelDeploymentUrl: string | null;
   errorMessage: string | null;
 }
 
-interface Tenant {
-  id: string;
-  name: string;
+interface LogEntry {
+  timestamp: number;
+  level: string;
+  message: string;
+  source?: string;
 }
 
 const DEFAULT_CODE = `export async function countdown(payload: any) {
@@ -27,10 +29,10 @@ const DEFAULT_CODE = `export async function countdown(payload: any) {
 
   for (let i = start; i > 0; i--) {
     console.log(\`  \${i}...\`);
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 200));
   }
 
-  console.log('Liftoff! 🚀');
+  console.log('Liftoff!');
   return {
     counted: start,
     message: 'Countdown complete!',
@@ -40,151 +42,140 @@ const DEFAULT_CODE = `export async function countdown(payload: any) {
 
 export async function fetchData(payload: any) {
   const url = payload.url || 'https://jsonplaceholder.typicode.com/posts/1';
-  console.log(\`Fetching data from: \${url}\`);
+  console.log(\`Fetching: \${url}\`);
 
-  const start = Date.now();
   const response = await fetch(url);
   const data = await response.json();
-  const duration = Date.now() - start;
 
-  console.log(\`Fetched in \${duration}ms - Status: \${response.status}\`);
-  return {
-    status: response.status,
-    duration,
-    data
-  };
-}
-
-export async function transform(payload: any) {
-  console.log('Input:', JSON.stringify(payload));
-
-  const result = {
-    ...payload,
-    processed: true,
-    uppercase: payload.text?.toUpperCase(),
-    reversed: payload.text?.split('').reverse().join(''),
-    timestamp: new Date().toISOString()
-  };
-
-  console.log('Output:', JSON.stringify(result));
-  return result;
+  return { status: response.status, data };
 }
 `;
 
 export default function Home() {
   const [workers, setWorkers] = useState<Worker[]>([]);
-  const [tenants, setTenants] = useState<Tenant[]>([]);
   const [selectedWorker, setSelectedWorker] = useState<Worker | null>(null);
   const [code, setCode] = useState(DEFAULT_CODE);
   const [workerName, setWorkerName] = useState("my-worker");
-  const [tenantId, setTenantId] = useState("");
-  const [newTenantName, setNewTenantName] = useState("");
   const [isDeploying, setIsDeploying] = useState(false);
-  const [isCreatingTenant, setIsCreatingTenant] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showNewTenant, setShowNewTenant] = useState(false);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamError, setStreamError] = useState<string | null>(null);
 
-  // Fetch workers and tenants on mount
   useEffect(() => {
     fetchWorkers();
-    fetchTenants();
   }, []);
 
-  // Poll for worker status updates
+  // Poll for building workers
   useEffect(() => {
-    const buildingWorkers = workers.filter((w) => w.status === "building");
-    if (buildingWorkers.length === 0) return;
+    const building = workers.filter((w) => w.status === "building");
+    if (building.length === 0) return;
 
     const interval = setInterval(() => {
-      buildingWorkers.forEach((worker) => {
-        refreshWorkerStatus(worker.id);
-      });
+      building.forEach((w) => refreshWorker(w.id));
     }, 3000);
 
     return () => clearInterval(interval);
   }, [workers]);
 
-  async function fetchTenants() {
-    try {
-      const res = await fetch("/api/tenants");
-      if (res.ok) {
-        const data = await res.json();
-        setTenants(data);
-        if (data.length > 0 && !tenantId) {
-          setTenantId(data[0].id);
-        }
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current);
       }
-    } catch (err) {
-      console.error("Failed to fetch tenants:", err);
+    };
+  }, []);
+
+  // Stop streaming when worker changes
+  useEffect(() => {
+    stopStreaming();
+  }, [selectedWorker?.id]);
+
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+  const seenLogsRef = useRef<Set<string>>(new Set());
+
+  const startStreaming = useCallback(() => {
+    if (!selectedWorker) return;
+
+    // Clear previous polling
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
     }
-  }
+
+    setStreamError(null);
+    setIsStreaming(true);
+    setLogs([]);
+    seenLogsRef.current = new Set();
+
+    // Poll for logs every 1 second
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/workers/${selectedWorker.id}/logs/poll`);
+        if (!res.ok) {
+          const data = await res.json();
+          setStreamError(data.error || 'Failed to fetch logs');
+          return;
+        }
+        const data = await res.json();
+        if (data.logs && Array.isArray(data.logs)) {
+          const newLogs: LogEntry[] = [];
+          for (const log of data.logs) {
+            // Create unique key for deduplication
+            const key = `${log.timestamp}-${log.message}`;
+            if (!seenLogsRef.current.has(key)) {
+              seenLogsRef.current.add(key);
+              newLogs.push(log);
+            }
+          }
+          if (newLogs.length > 0) {
+            setLogs((prev) => [...prev, ...newLogs]);
+          }
+        }
+      } catch (err) {
+        console.error('Polling error:', err);
+      }
+    };
+
+    // Initial poll
+    poll();
+    // Then poll every second
+    pollingRef.current = setInterval(poll, 1000);
+  }, [selectedWorker]);
+
+  const stopStreaming = useCallback(() => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    setIsStreaming(false);
+  }, []);
 
   async function fetchWorkers() {
     try {
       const res = await fetch("/api/workers");
       if (res.ok) {
-        const data = await res.json();
-        setWorkers(data);
+        setWorkers(await res.json());
       }
     } catch (err) {
       console.error("Failed to fetch workers:", err);
     }
   }
 
-  const refreshWorkerStatus = useCallback(async (workerId: string) => {
+  const refreshWorker = useCallback(async (id: string) => {
     try {
-      const res = await fetch(`/api/workers/${workerId}`);
+      const res = await fetch(`/api/workers/${id}`);
       if (res.ok) {
         const updated = await res.json();
-        setWorkers((prev) =>
-          prev.map((w) => (w.id === workerId ? updated : w))
-        );
-        setSelectedWorker((prev) => (prev?.id === workerId ? updated : prev));
+        setWorkers((prev) => prev.map((w) => (w.id === id ? updated : w)));
+        setSelectedWorker((prev) => (prev?.id === id ? updated : prev));
       }
     } catch (err) {
-      console.error("Failed to refresh worker status:", err);
+      console.error("Failed to refresh worker:", err);
     }
   }, []);
 
-  async function handleCreateTenant() {
-    if (!newTenantName.trim()) {
-      setError("Please enter a tenant name");
-      return;
-    }
-
-    setIsCreatingTenant(true);
-    setError(null);
-
-    try {
-      const res = await fetch("/api/tenants", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newTenantName.trim() }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || "Failed to create tenant");
-      }
-
-      setTenants((prev) => [data, ...prev]);
-      setTenantId(data.id);
-      setNewTenantName("");
-      setShowNewTenant(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create tenant");
-    } finally {
-      setIsCreatingTenant(false);
-    }
-  }
-
   async function handleDeploy() {
-    if (!tenantId) {
-      setError("Please select or create a tenant");
-      return;
-    }
-
     if (!workerName.trim()) {
       setError("Please enter a worker name");
       return;
@@ -194,7 +185,7 @@ export default function Home() {
     setError(null);
 
     try {
-      const res = await fetch(`/api/tenants/${tenantId}/workers`, {
+      const res = await fetch("/api/workers", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: workerName.trim(), code }),
@@ -206,14 +197,13 @@ export default function Home() {
         throw new Error(data.error || "Deployment failed");
       }
 
-      // Add new worker to list
       const newWorker: Worker = {
         id: data.id,
         name: data.name,
-        tenantId,
+        deploymentId: data.deploymentId,
+        deploymentUrl: data.deploymentUrl,
         status: "building",
         functions: data.functions,
-        vercelDeploymentUrl: null,
         errorMessage: null,
       };
 
@@ -226,15 +216,12 @@ export default function Home() {
     }
   }
 
-  async function handleDelete(workerId: string) {
+  async function handleDelete(id: string) {
     try {
-      const res = await fetch(`/api/workers/${workerId}`, {
-        method: "DELETE",
-      });
-
+      const res = await fetch(`/api/workers/${id}`, { method: "DELETE" });
       if (res.ok) {
-        setWorkers((prev) => prev.filter((w) => w.id !== workerId));
-        if (selectedWorker?.id === workerId) {
+        setWorkers((prev) => prev.filter((w) => w.id !== id));
+        if (selectedWorker?.id === id) {
           setSelectedWorker(null);
         }
       }
@@ -251,24 +238,27 @@ export default function Home() {
             Workers Platform
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400 mt-1">
-            Deploy and invoke TypeScript worker functions
+            Deploy code → Get immutable URL → Invoke functions
           </p>
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left column: Worker list */}
+          {/* Left: Worker list */}
           <div className="lg:col-span-1">
             <WorkerList
               workers={workers}
               selectedWorker={selectedWorker}
-              onSelect={setSelectedWorker}
+              onSelect={(w) => {
+                setSelectedWorker(w);
+                setLogs([]);
+              }}
               onDelete={handleDelete}
             />
           </div>
 
-          {/* Middle column: Code editor */}
+          {/* Middle: Deploy */}
           <div className="lg:col-span-1">
             <div className="bg-white dark:bg-zinc-950 rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
               <h2 className="text-lg font-semibold mb-4 text-zinc-900 dark:text-zinc-100">
@@ -276,71 +266,6 @@ export default function Home() {
               </h2>
 
               <div className="space-y-4">
-                {/* Tenant selector */}
-                <div>
-                  <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
-                    Tenant
-                  </label>
-                  {showNewTenant ? (
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={newTenantName}
-                        onChange={(e) => setNewTenantName(e.target.value)}
-                        placeholder="Tenant name"
-                        className="flex-1 px-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-md bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      />
-                      <button
-                        onClick={handleCreateTenant}
-                        disabled={isCreatingTenant}
-                        className="px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-medium rounded-md transition-colors"
-                      >
-                        {isCreatingTenant ? "..." : "Create"}
-                      </button>
-                      <button
-                        onClick={() => setShowNewTenant(false)}
-                        className="px-3 py-2 bg-zinc-200 hover:bg-zinc-300 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 rounded-md transition-colors"
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="flex gap-2">
-                      <select
-                        value={tenantId}
-                        onChange={(e) => setTenantId(e.target.value)}
-                        className="flex-1 px-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-md bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      >
-                        <option value="">Select a tenant...</option>
-                        {tenants.map((tenant) => (
-                          <option key={tenant.id} value={tenant.id}>
-                            {tenant.name}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        onClick={() => setShowNewTenant(true)}
-                        className="px-3 py-2 bg-zinc-200 hover:bg-zinc-300 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 rounded-md transition-colors"
-                        title="Create new tenant"
-                      >
-                        <svg
-                          className="w-5 h-5"
-                          fill="none"
-                          viewBox="0 0 24 24"
-                          stroke="currentColor"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2}
-                            d="M12 4v16m8-8H4"
-                          />
-                        </svg>
-                      </button>
-                    </div>
-                  )}
-                </div>
-
                 <div>
                   <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1">
                     Worker Name
@@ -350,7 +275,7 @@ export default function Home() {
                     value={workerName}
                     onChange={(e) => setWorkerName(e.target.value)}
                     placeholder="my-worker"
-                    className="w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-md bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    className="w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-md bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100"
                   />
                 </div>
 
@@ -358,99 +283,76 @@ export default function Home() {
 
                 {error && (
                   <div className="p-3 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-md">
-                    <p className="text-red-600 dark:text-red-400 text-sm">
-                      {error}
-                    </p>
+                    <p className="text-red-600 dark:text-red-400 text-sm">{error}</p>
                   </div>
                 )}
 
                 <button
                   onClick={handleDeploy}
-                  disabled={isDeploying || !tenantId}
-                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 disabled:cursor-not-allowed text-white font-medium rounded-md transition-colors flex items-center justify-center gap-2"
+                  disabled={isDeploying}
+                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-medium rounded-md flex items-center justify-center gap-2"
                 >
                   {isDeploying ? (
                     <>
-                      <svg
-                        className="w-4 h-4 animate-spin"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                      >
-                        <circle
-                          className="opacity-25"
-                          cx="12"
-                          cy="12"
-                          r="10"
-                          stroke="currentColor"
-                          strokeWidth="4"
-                        />
-                        <path
-                          className="opacity-75"
-                          fill="currentColor"
-                          d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                        />
+                      <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                       </svg>
                       Deploying...
                     </>
                   ) : (
-                    <>
-                      <svg
-                        className="w-4 h-4"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth={2}
-                          d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-                        />
-                      </svg>
-                      Deploy Worker
-                    </>
+                    "Deploy Worker"
                   )}
                 </button>
               </div>
             </div>
           </div>
 
-          {/* Right column: Function invoker + Logs */}
+          {/* Right: Invoke + Logs */}
           <div className="lg:col-span-1 space-y-6">
             {selectedWorker ? (
               <>
-                <FunctionInvoker worker={selectedWorker} />
-                <LogViewer worker={selectedWorker} />
+                {/* Show deployment URL prominently */}
+                {selectedWorker.status === "ready" && (
+                  <div className="bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg p-4">
+                    <p className="text-sm font-medium text-green-800 dark:text-green-200 mb-1">
+                      Immutable Deployment URL
+                    </p>
+                    <code className="text-xs text-green-700 dark:text-green-300 break-all">
+                      {selectedWorker.deploymentUrl}
+                    </code>
+                  </div>
+                )}
+
+                <FunctionInvoker
+                  worker={selectedWorker}
+                  onLogs={(newLogs) => {
+                    // Only use batch logs if not streaming
+                    if (!isStreaming) {
+                      setLogs(newLogs);
+                    }
+                  }}
+                />
+                <LogViewer
+                  worker={selectedWorker}
+                  logs={logs}
+                  onClear={() => setLogs([])}
+                  isStreaming={isStreaming}
+                  streamError={streamError}
+                  onStartStream={startStreaming}
+                  onStopStream={stopStreaming}
+                />
               </>
             ) : (
               <div className="bg-white dark:bg-zinc-950 rounded-lg border border-zinc-200 dark:border-zinc-800 p-8 text-center">
-                <svg
-                  className="w-12 h-12 mx-auto text-zinc-300 dark:text-zinc-700 mb-4"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={1.5}
-                    d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
-                  />
-                </svg>
                 <p className="text-zinc-500 dark:text-zinc-400">
-                  Select a worker to invoke functions and view logs
+                  Select a worker or deploy a new one
                 </p>
               </div>
             )}
           </div>
         </div>
       </main>
-
-      <footer className="border-t border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-6 py-4 mt-8">
-        <div className="max-w-7xl mx-auto text-center text-sm text-zinc-500 dark:text-zinc-400">
-          Workers Platform PoC - Powered by Vercel
-        </div>
-      </footer>
     </div>
   );
 }

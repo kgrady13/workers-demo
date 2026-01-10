@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db/client';
 
 // POST /api/workers/:id/functions/:fn - Invoke a worker function
+// This is optional - clients can call the deployment URL directly
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string; fn: string }> }
@@ -25,13 +26,6 @@ export async function POST(
       );
     }
 
-    if (!worker.vercel_deployment_url) {
-      return NextResponse.json(
-        { error: 'Worker deployment URL not available' },
-        { status: 400 }
-      );
-    }
-
     if (!worker.functions.includes(fn)) {
       return NextResponse.json(
         { error: `Function '${fn}' not found. Available: ${worker.functions.join(', ')}` },
@@ -42,21 +36,16 @@ export async function POST(
     // Get request payload
     const payload = await request.json().catch(() => ({}));
 
-    // Invoke the worker function
-    const workerUrl = `${worker.vercel_deployment_url}/api/invoke/${fn}`;
-
-    console.log(`Invoking function ${fn} at ${workerUrl}`);
+    // Proxy to the immutable deployment URL
+    const workerUrl = `${worker.deployment_url}/api/invoke/${fn}`;
 
     const response = await fetch(workerUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
 
     const result = await response.json();
-
     return NextResponse.json(result, { status: response.status });
   } catch (error) {
     console.error('Error invoking function:', error);

@@ -7,7 +7,7 @@ export async function POST() {
     await db.initSchema();
     return NextResponse.json({
       success: true,
-      message: 'Database schema initialized successfully',
+      message: 'Database schema initialized',
     });
   } catch (error) {
     console.error('Error initializing database:', error);
@@ -21,19 +21,18 @@ export async function POST() {
   }
 }
 
-// GET /api/setup - Check if database is initialized
+// GET /api/setup - Check database status
 export async function GET() {
   try {
-    // Try to query tenants table to check if schema exists
-    await db.getAllTenants();
+    await db.getAllWorkers();
     return NextResponse.json({
       initialized: true,
-      message: 'Database is initialized',
+      message: 'Database ready',
     });
-  } catch (error) {
+  } catch {
     return NextResponse.json({
       initialized: false,
-      message: 'Database not initialized. POST to /api/setup to initialize.',
+      message: 'Run POST /api/setup to initialize',
     });
   }
 }

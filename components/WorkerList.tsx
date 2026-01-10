@@ -3,10 +3,10 @@
 interface Worker {
   id: string;
   name: string;
-  tenantId: string;
+  deploymentId: string;
+  deploymentUrl: string;
   status: 'building' | 'ready' | 'error';
   functions: string[];
-  vercelDeploymentUrl: string | null;
   errorMessage: string | null;
 }
 

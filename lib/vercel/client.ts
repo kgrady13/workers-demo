@@ -1,22 +1,19 @@
-import {
-  VercelProject,
-  VercelDeployment,
-  VercelFile,
-  RuntimeLog
-} from './types';
+import { VercelDeployment, VercelFile } from './types';
 
 const VERCEL_API_BASE = 'https://api.vercel.com';
 
 export class VercelClient {
   private token: string;
   private teamId: string;
+  private projectId: string;
 
   constructor() {
     this.token = process.env.VERCEL_API_TOKEN!;
     this.teamId = process.env.VERCEL_TEAM_ID!;
+    this.projectId = process.env.VERCEL_WORKER_PROJECT_ID!;
 
-    if (!this.token || !this.teamId) {
-      throw new Error('VERCEL_API_TOKEN and VERCEL_TEAM_ID are required');
+    if (!this.token || !this.teamId || !this.projectId) {
+      throw new Error('VERCEL_API_TOKEN, VERCEL_TEAM_ID, and VERCEL_WORKER_PROJECT_ID are required');
     }
   }
 
@@ -43,7 +40,6 @@ export class VercelClient {
       );
     }
 
-    // Handle 204 No Content
     if (response.status === 204) {
       return null as T;
     }
@@ -52,65 +48,35 @@ export class VercelClient {
   }
 
   /**
-   * Create a new Vercel project
+   * Create a deployment in the shared worker project
    */
-  async createProject(name: string): Promise<VercelProject> {
-    return this.request<VercelProject>('/v11/projects', {
+  async createDeployment(files: VercelFile[]): Promise<VercelDeployment> {
+    return this.request<VercelDeployment>('/v13/deployments', {
       method: 'POST',
       body: JSON.stringify({
-        name,
-        framework: 'nextjs',
-        buildCommand: 'next build',
-        outputDirectory: '.next',
+        name: 'worker-deployments',
+        files,
+        project: this.projectId,
+        projectSettings: {
+          buildCommand: 'next build',
+          installCommand: 'npm install',
+          outputDirectory: '.next',
+          framework: 'nextjs',
+        },
+        target: 'production',
       }),
     });
   }
 
   /**
-   * Update project settings (e.g., disable SSO protection)
-   */
-  async updateProject(projectId: string, settings: Record<string, unknown>): Promise<VercelProject> {
-    return this.request<VercelProject>(`/v9/projects/${projectId}`, {
-      method: 'PATCH',
-      body: JSON.stringify(settings),
-    });
-  }
-
-  /**
-   * Create a deployment with inline files
-   */
-  async createDeployment(
-    projectId: string,
-    files: VercelFile[]
-  ): Promise<VercelDeployment> {
-    const request = {
-      name: projectId,
-      files,
-      project: projectId,
-      projectSettings: {
-        buildCommand: 'next build',
-        installCommand: 'npm install',
-        outputDirectory: '.next',
-        framework: 'nextjs',
-      },
-      target: 'production',
-    };
-
-    return this.request<VercelDeployment>('/v13/deployments', {
-      method: 'POST',
-      body: JSON.stringify(request),
-    });
-  }
-
-  /**
-   * Get deployment status by ID
+   * Get deployment status
    */
   async getDeployment(deploymentId: string): Promise<VercelDeployment> {
     return this.request<VercelDeployment>(`/v13/deployments/${deploymentId}`);
   }
 
   /**
-   * Poll deployment until ready or error
+   * Wait for deployment to be ready
    */
   async waitForDeployment(
     deploymentId: string,
@@ -137,36 +103,53 @@ export class VercelClient {
   }
 
   /**
-   * Delete a project and all its deployments
+   * Get project ID (for logs API)
    */
-  async deleteProject(projectIdOrName: string): Promise<void> {
-    await this.request(`/v9/projects/${projectIdOrName}`, {
-      method: 'DELETE',
-    });
+  getProjectId(): string {
+    return this.projectId;
   }
 
   /**
-   * Get runtime logs for a deployment
-   * Returns an async generator for streaming logs
+   * Get token for direct API calls
    */
-  async *streamRuntimeLogs(
-    projectId: string,
-    deploymentId: string
-  ): AsyncGenerator<RuntimeLog> {
+  getToken(): string {
+    return this.token;
+  }
+
+  /**
+   * Get team ID
+   */
+  getTeamId(): string {
+    return this.teamId;
+  }
+
+  /**
+   * Stream runtime logs for a deployment
+   * Uses the Vercel Runtime Logs API
+   * @see https://vercel.com/docs/rest-api/endpoints/logs#get-runtime-logs
+   */
+  async *streamLogs(deploymentId: string): AsyncGenerator<{
+    timestamp: number;
+    level: string;
+    message: string;
+    source?: string;
+  }> {
     const url = new URL(
-      `${VERCEL_API_BASE}/v1/projects/${projectId}/deployments/${deploymentId}/runtime-logs`
+      `${VERCEL_API_BASE}/v1/projects/${this.projectId}/deployments/${deploymentId}/runtime-logs`
     );
     url.searchParams.set('teamId', this.teamId);
 
     const response = await fetch(url.toString(), {
       headers: {
         'Authorization': `Bearer ${this.token}`,
-        'Accept': 'application/x-ndjson',
       },
     });
 
     if (!response.ok) {
-      throw new Error(`Failed to stream logs: ${response.status}`);
+      const error = await response.json().catch(() => ({}));
+      throw new Error(
+        `Failed to stream logs: ${response.status} - ${error.error?.message || response.statusText}`
+      );
     }
 
     const reader = response.body?.getReader();
@@ -177,61 +160,38 @@ export class VercelClient {
     const decoder = new TextDecoder();
     let buffer = '';
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-      for (const line of lines) {
-        if (line.trim()) {
+        for (const line of lines) {
+          if (!line.trim()) continue;
           try {
-            const log = JSON.parse(line) as RuntimeLog;
-            yield log;
+            const event = JSON.parse(line);
+            // Runtime logs format has: timestamp, level, message, source
+            yield {
+              timestamp: event.timestamp || Date.now(),
+              level: event.level || 'info',
+              message: event.message || '',
+              source: event.source,
+            };
           } catch {
-            // Skip malformed lines
+            // Skip non-JSON lines
           }
         }
       }
+    } finally {
+      reader.releaseLock();
     }
-  }
-
-  /**
-   * Get historic logs (collects from stream)
-   */
-  async getHistoricLogs(
-    projectId: string,
-    deploymentId: string,
-    options: {
-      since?: number;
-      until?: number;
-      limit?: number;
-    } = {}
-  ): Promise<RuntimeLog[]> {
-    const logs: RuntimeLog[] = [];
-    const limit = options.limit || 100;
-
-    try {
-      for await (const log of this.streamRuntimeLogs(projectId, deploymentId)) {
-        // Filter by time if specified
-        if (options.since && log.timestampInMs < options.since) continue;
-        if (options.until && log.timestampInMs > options.until) continue;
-
-        logs.push(log);
-        if (logs.length >= limit) break;
-      }
-    } catch (error) {
-      // Log streaming may fail if no logs exist yet, return empty array
-      console.error('Error fetching logs:', error);
-    }
-
-    return logs;
   }
 }
 
-// Singleton instance
+// Singleton
 let vercelClient: VercelClient | null = null;
 
 export function getVercelClient(): VercelClient {
