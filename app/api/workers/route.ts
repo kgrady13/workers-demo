@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { after } from 'next/server';
 import { db } from '@/lib/db/client';
 import { getVercelClient } from '@/lib/vercel/client';
 import { generateWorkerFiles } from '@/lib/worker-template/generator';
@@ -38,8 +39,10 @@ export async function POST(request: NextRequest) {
       functions,
     });
 
-    // Wait for deployment in background
-    waitForDeployment(worker.id, deployment.id);
+    // Wait for deployment in background (after response is sent)
+    after(async () => {
+      await waitForDeployment(worker.id, deployment.id);
+    });
 
     return NextResponse.json({
       id: worker.id,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import WorkerList from "@/components/WorkerList";
 import CodeEditor from "@/components/CodeEditor";
 import FunctionInvoker from "@/components/FunctionInvoker";
@@ -20,7 +20,6 @@ interface LogEntry {
   timestamp: number;
   level: string;
   message: string;
-  source?: string;
 }
 
 const DEFAULT_CODE = `export async function countdown(payload: any) {
@@ -59,104 +58,24 @@ export default function Home() {
   const [isDeploying, setIsDeploying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [streamError, setStreamError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchWorkers();
   }, []);
 
-  // Poll for building workers
   useEffect(() => {
     const building = workers.filter((w) => w.status === "building");
     if (building.length === 0) return;
-
     const interval = setInterval(() => {
       building.forEach((w) => refreshWorker(w.id));
     }, 3000);
-
     return () => clearInterval(interval);
   }, [workers]);
-
-  // Cleanup polling on unmount
-  useEffect(() => {
-    return () => {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-      }
-    };
-  }, []);
-
-  // Stop streaming when worker changes
-  useEffect(() => {
-    stopStreaming();
-  }, [selectedWorker?.id]);
-
-  const pollingRef = useRef<NodeJS.Timeout | null>(null);
-  const seenLogsRef = useRef<Set<string>>(new Set());
-
-  const startStreaming = useCallback(() => {
-    if (!selectedWorker) return;
-
-    // Clear previous polling
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-    }
-
-    setStreamError(null);
-    setIsStreaming(true);
-    setLogs([]);
-    seenLogsRef.current = new Set();
-
-    // Poll for logs every 1 second
-    const poll = async () => {
-      try {
-        const res = await fetch(`/api/workers/${selectedWorker.id}/logs/poll`);
-        if (!res.ok) {
-          const data = await res.json();
-          setStreamError(data.error || 'Failed to fetch logs');
-          return;
-        }
-        const data = await res.json();
-        if (data.logs && Array.isArray(data.logs)) {
-          const newLogs: LogEntry[] = [];
-          for (const log of data.logs) {
-            // Create unique key for deduplication
-            const key = `${log.timestamp}-${log.message}`;
-            if (!seenLogsRef.current.has(key)) {
-              seenLogsRef.current.add(key);
-              newLogs.push(log);
-            }
-          }
-          if (newLogs.length > 0) {
-            setLogs((prev) => [...prev, ...newLogs]);
-          }
-        }
-      } catch (err) {
-        console.error('Polling error:', err);
-      }
-    };
-
-    // Initial poll
-    poll();
-    // Then poll every second
-    pollingRef.current = setInterval(poll, 1000);
-  }, [selectedWorker]);
-
-  const stopStreaming = useCallback(() => {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-    setIsStreaming(false);
-  }, []);
 
   async function fetchWorkers() {
     try {
       const res = await fetch("/api/workers");
-      if (res.ok) {
-        setWorkers(await res.json());
-      }
+      if (res.ok) setWorkers(await res.json());
     } catch (err) {
       console.error("Failed to fetch workers:", err);
     }
@@ -192,10 +111,7 @@ export default function Home() {
       });
 
       const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || "Deployment failed");
-      }
+      if (!res.ok) throw new Error(data.error || "Deployment failed");
 
       const newWorker: Worker = {
         id: data.id,
@@ -221,9 +137,7 @@ export default function Home() {
       const res = await fetch(`/api/workers/${id}`, { method: "DELETE" });
       if (res.ok) {
         setWorkers((prev) => prev.filter((w) => w.id !== id));
-        if (selectedWorker?.id === id) {
-          setSelectedWorker(null);
-        }
+        if (selectedWorker?.id === id) setSelectedWorker(null);
       }
     } catch (err) {
       console.error("Failed to delete worker:", err);
@@ -245,7 +159,6 @@ export default function Home() {
 
       <main className="max-w-7xl mx-auto px-6 py-8">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: Worker list */}
           <div className="lg:col-span-1">
             <WorkerList
               workers={workers}
@@ -258,7 +171,6 @@ export default function Home() {
             />
           </div>
 
-          {/* Middle: Deploy */}
           <div className="lg:col-span-1">
             <div className="bg-white dark:bg-zinc-950 rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
               <h2 className="text-lg font-semibold mb-4 text-zinc-900 dark:text-zinc-100">
@@ -308,11 +220,9 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Right: Invoke + Logs */}
           <div className="lg:col-span-1 space-y-6">
             {selectedWorker ? (
               <>
-                {/* Show deployment URL prominently */}
                 {selectedWorker.status === "ready" && (
                   <div className="bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg p-4">
                     <p className="text-sm font-medium text-green-800 dark:text-green-200 mb-1">
@@ -327,20 +237,16 @@ export default function Home() {
                 <FunctionInvoker
                   worker={selectedWorker}
                   onLogs={(newLogs) => {
-                    // Only use batch logs if not streaming
-                    if (!isStreaming) {
-                      setLogs(newLogs);
-                    }
+                    setLogs([]);
+                    newLogs.forEach((log, i) => {
+                      setTimeout(() => setLogs(prev => [...prev, log]), i * 40);
+                    });
                   }}
                 />
                 <LogViewer
                   worker={selectedWorker}
                   logs={logs}
                   onClear={() => setLogs([])}
-                  isStreaming={isStreaming}
-                  streamError={streamError}
-                  onStartStream={startStreaming}
-                  onStopStream={stopStreaming}
                 />
               </>
             ) : (

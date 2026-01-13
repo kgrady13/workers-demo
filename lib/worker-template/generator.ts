@@ -45,7 +45,6 @@ function generatePackageJson(workerName: string): string {
       next: '16.1.1',
       react: '19.0.0',
       'react-dom': '19.0.0',
-      'workflow': '4.0.1-beta.44',
     },
     devDependencies: {
       '@types/node': '^22',
@@ -56,15 +55,14 @@ function generatePackageJson(workerName: string): string {
 }
 
 /**
- * Generate next.config.ts with workflow plugin
+ * Generate next.config.ts
  */
 function generateNextConfig(): string {
-  return `import { withWorkflow } from "workflow/next";
-import type { NextConfig } from "next";
+  return `import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {};
 
-export default withWorkflow(nextConfig);
+export default nextConfig;
 `;
 }
 
@@ -97,49 +95,32 @@ function generateTsConfig(): string {
 
 /**
  * Generate the dynamic API route handler
- * This wraps user code and exposes functions via /api/invoke/[fn]
+ * Exposes user functions via /api/invoke/[fn]
  */
 function generateApiRoute(userCode: string, functionNames: string[]): string {
-  // Generate step-wrapped versions of each user function for automatic retries
-  const stepFunctions = functionNames.map(fn => `
-// Step-wrapped version of ${fn} - gets automatic retries and durability
-async function ${fn}Step(payload: any) {
-  "use step";
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return await (${fn} as any)(payload);
-}
-`).join('\n');
-
   return `import { NextRequest, NextResponse } from 'next/server';
+import { AsyncLocalStorage } from 'async_hooks';
 
-// Capture console.log output
-const capturedLogs: { timestamp: number; level: string; message: string }[] = [];
-const originalLog = console.log;
-const originalError = console.error;
-const originalWarn = console.warn;
+// Request-scoped log storage
+type LogEntry = { level: string; message: string; timestamp: number };
+const logStorage = new AsyncLocalStorage<LogEntry[]>();
 
-function captureLog(level: string, ...args: any[]) {
+const wrap = (level: string, orig: typeof console.log) => (...args: any[]) => {
+  const logs = logStorage.getStore();
   const message = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-  capturedLogs.push({ timestamp: Date.now(), level, message });
-  // Also send to real console
-  if (level === 'error') originalError(...args);
-  else if (level === 'warn') originalWarn(...args);
-  else originalLog(...args);
-}
-
-console.log = (...args) => captureLog('info', ...args);
-console.error = (...args) => captureLog('error', ...args);
-console.warn = (...args) => captureLog('warn', ...args);
+  if (logs) logs.push({ level, message, timestamp: Date.now() });
+  orig(...args);
+};
+console.log = wrap('info', console.log);
+console.warn = wrap('warn', console.warn);
+console.error = wrap('error', console.error);
 
 // User code
 ${userCode}
 
-// Step-wrapped functions with automatic retries and durability
-${stepFunctions}
-
-// Function registry mapping to step-wrapped versions
+// Function registry
 const functions: Record<string, (payload: any) => Promise<any>> = {
-${functionNames.map(fn => `  '${fn}': ${fn}Step,`).join('\n')}
+${functionNames.map(fn => `  '${fn}': ${fn},`).join('\n')}
 };
 
 export async function POST(
@@ -156,46 +137,24 @@ export async function POST(
     );
   }
 
-  // Clear captured logs for this request
-  capturedLogs.length = 0;
+  // Run with request-scoped logs
+  const logs: LogEntry[] = [];
+  return logStorage.run(logs, async () => {
+    try {
+      const payload = await request.json().catch(() => ({}));
+      const startTime = Date.now();
+      const result = await func(payload);
+      const duration = Date.now() - startTime;
 
-  try {
-    const payload = await request.json().catch(() => ({}));
-
-    console.log(\`[INVOKE] Function: \${fn}, Payload: \${JSON.stringify(payload)}\`);
-
-    const startTime = Date.now();
-    // Execute the workflow - gets automatic retries, durability, observability
-    const result = await func(payload);
-    const duration = Date.now() - startTime;
-
-    console.log(\`[RESULT] Function: \${fn}, Duration: \${duration}ms\`);
-
-    return NextResponse.json({
-      success: true,
-      function: fn,
-      result,
-      duration,
-      durable: true,
-      logs: [...capturedLogs],  // Return captured logs
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown error';
-    console.error(\`[ERROR] Function: \${fn}, Error: \${message}\`);
-
-    return NextResponse.json(
-      {
-        success: false,
-        function: fn,
-        error: message,
-        logs: [...capturedLogs],  // Return captured logs even on error
-      },
-      { status: 500 }
-    );
-  }
+      return NextResponse.json({ success: true, function: fn, result, duration, logs });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      console.error(\`[ERROR] \${fn}: \${message}\`);
+      return NextResponse.json({ success: false, function: fn, error: message, logs }, { status: 500 });
+    }
+  });
 }
 
-// Health check endpoint
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ fn: string }> }
@@ -203,12 +162,9 @@ export async function GET(
   const { fn } = await params;
 
   return NextResponse.json({
-    status: 'healthy',
     function: fn,
     available: fn in functions,
     allFunctions: Object.keys(functions),
-    durable: true,
-    timestamp: new Date().toISOString(),
   });
 }
 `;
