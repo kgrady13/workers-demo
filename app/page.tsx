@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect } from "react";
 import WorkerList from "@/components/WorkerList";
 import CodeEditor from "@/components/CodeEditor";
 import FunctionInvoker from "@/components/FunctionInvoker";
@@ -9,11 +9,11 @@ import LogViewer from "@/components/LogViewer";
 interface Worker {
   id: string;
   name: string;
-  deploymentId: string;
-  deploymentUrl: string;
-  status: "building" | "ready" | "error";
+  snapshotId: string;
+  status: "creating" | "ready" | "error" | "expired";
   functions: string[];
   errorMessage: string | null;
+  expiresInDays?: number | null;
 }
 
 interface LogEntry {
@@ -58,19 +58,11 @@ export default function Home() {
   const [isDeploying, setIsDeploying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
 
   useEffect(() => {
     fetchWorkers();
   }, []);
-
-  useEffect(() => {
-    const building = workers.filter((w) => w.status === "building");
-    if (building.length === 0) return;
-    const interval = setInterval(() => {
-      building.forEach((w) => refreshWorker(w.id));
-    }, 3000);
-    return () => clearInterval(interval);
-  }, [workers]);
 
   async function fetchWorkers() {
     try {
@@ -80,19 +72,6 @@ export default function Home() {
       console.error("Failed to fetch workers:", err);
     }
   }
-
-  const refreshWorker = useCallback(async (id: string) => {
-    try {
-      const res = await fetch(`/api/workers/${id}`);
-      if (res.ok) {
-        const updated = await res.json();
-        setWorkers((prev) => prev.map((w) => (w.id === id ? updated : w)));
-        setSelectedWorker((prev) => (prev?.id === id ? updated : prev));
-      }
-    } catch (err) {
-      console.error("Failed to refresh worker:", err);
-    }
-  }, []);
 
   async function handleDeploy() {
     if (!workerName.trim()) {
@@ -113,14 +92,15 @@ export default function Home() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Deployment failed");
 
+      // With sandboxes, workers are ready immediately (no build phase)
       const newWorker: Worker = {
         id: data.id,
         name: data.name,
-        deploymentId: data.deploymentId,
-        deploymentUrl: data.deploymentUrl,
-        status: "building",
+        snapshotId: data.snapshotId,
+        status: data.status, // Should be 'ready' immediately
         functions: data.functions,
         errorMessage: null,
+        expiresInDays: data.expiresInDays,
       };
 
       setWorkers((prev) => [newWorker, ...prev]);
@@ -144,6 +124,20 @@ export default function Home() {
     }
   }
 
+  // Handle individual log entries (real-time streaming)
+  function handleLog(log: LogEntry) {
+    setLogs((prev) => [...prev, log]);
+  }
+
+  // Handle streaming state changes
+  function handleStreamingChange(streaming: boolean) {
+    setIsStreaming(streaming);
+    if (streaming) {
+      // Clear logs when starting a new invocation
+      setLogs([]);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-zinc-900">
       <header className="border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-6 py-4">
@@ -152,7 +146,7 @@ export default function Home() {
             Workers Platform
           </h1>
           <p className="text-zinc-600 dark:text-zinc-400 mt-1">
-            Deploy code → Get immutable URL → Invoke functions
+            Deploy code → Get snapshot → Invoke functions with real-time logs
           </p>
         </div>
       </header>
@@ -210,7 +204,7 @@ export default function Home() {
                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                       </svg>
-                      Deploying...
+                      Creating Snapshot...
                     </>
                   ) : (
                     "Deploy Worker"
@@ -223,30 +217,16 @@ export default function Home() {
           <div className="lg:col-span-1 space-y-6">
             {selectedWorker ? (
               <>
-                {selectedWorker.status === "ready" && (
-                  <div className="bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg p-4">
-                    <p className="text-sm font-medium text-green-800 dark:text-green-200 mb-1">
-                      Immutable Deployment URL
-                    </p>
-                    <code className="text-xs text-green-700 dark:text-green-300 break-all">
-                      {selectedWorker.deploymentUrl}
-                    </code>
-                  </div>
-                )}
-
                 <FunctionInvoker
                   worker={selectedWorker}
-                  onLogs={(newLogs) => {
-                    setLogs([]);
-                    newLogs.forEach((log, i) => {
-                      setTimeout(() => setLogs(prev => [...prev, log]), i * 40);
-                    });
-                  }}
+                  onLog={handleLog}
+                  onStreamingChange={handleStreamingChange}
                 />
                 <LogViewer
                   worker={selectedWorker}
                   logs={logs}
                   onClear={() => setLogs([])}
+                  isStreaming={isStreaming}
                 />
               </>
             ) : (

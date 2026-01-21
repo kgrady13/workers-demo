@@ -1,10 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { after } from 'next/server';
 import { db } from '@/lib/db/client';
-import { getVercelClient } from '@/lib/vercel/client';
-import { generateWorkerFiles } from '@/lib/worker-template/generator';
+import { getSandboxClient } from '@/lib/sandbox/client';
+import { generateWorkerScript } from '@/lib/sandbox/worker-script';
 
-// POST /api/workers - Deploy worker code, return immutable URL
+// Helper to calculate days until expiration
+function calculateExpiresInDays(expiresAt: Date | null): number | null {
+  if (!expiresAt) return null;
+  const now = new Date();
+  const diff = expiresAt.getTime() - now.getTime();
+  return Math.max(0, Math.ceil(diff / (1000 * 60 * 60 * 24)));
+}
+
+// POST /api/workers - Deploy worker code using sandbox snapshot
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -23,35 +30,33 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Generate Next.js project files from user code
-    const { files, functions } = generateWorkerFiles(body.name, body.code);
+    // Generate Node.js worker script from user code
+    const { script, functions } = generateWorkerScript(body.code);
 
-    // Create deployment in the shared project
-    const vercel = getVercelClient();
-    const deployment = await vercel.createDeployment(files);
+    // Create sandbox and snapshot (synchronous - no build phase!)
+    const sandboxClient = getSandboxClient();
+    const { snapshotId, expiresAt } = await sandboxClient.createWorkerSnapshot(
+      script,
+      functions
+    );
 
-    // Store worker with deployment info
+    // Store worker with snapshot info - status is 'ready' immediately
     const worker = await db.createWorker({
       name: body.name,
-      deploymentId: deployment.id,
-      deploymentUrl: `https://${deployment.url}`,
+      snapshotId,
       sourceCode: body.code,
       functions,
-    });
-
-    // Wait for deployment in background (after response is sent)
-    after(async () => {
-      await waitForDeployment(worker.id, deployment.id);
+      snapshotExpiresAt: expiresAt,
     });
 
     return NextResponse.json({
       id: worker.id,
       name: worker.name,
-      deploymentId: deployment.id,
-      deploymentUrl: `https://${deployment.url}`,
+      snapshotId: worker.snapshot_id,
       functions,
-      status: 'building',
-    }, { status: 202 });
+      status: 'ready', // Immediate - no build phase!
+      expiresInDays: calculateExpiresInDays(expiresAt),
+    }, { status: 201 });
 
   } catch (error) {
     console.error('Error deploying worker:', error);
@@ -62,21 +67,6 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Background task to wait for deployment
-async function waitForDeployment(workerId: string, deploymentId: string) {
-  const vercel = getVercelClient();
-
-  try {
-    const deployment = await vercel.waitForDeployment(deploymentId);
-    await db.updateWorkerReady(workerId, `https://${deployment.url}`);
-    console.log(`Worker ${workerId} ready at https://${deployment.url}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Deployment failed';
-    await db.updateWorkerError(workerId, message);
-    console.error(`Worker ${workerId} failed: ${message}`);
-  }
-}
-
 // GET /api/workers - List all workers
 export async function GET() {
   try {
@@ -84,12 +74,14 @@ export async function GET() {
     return NextResponse.json(workers.map(w => ({
       id: w.id,
       name: w.name,
-      deploymentId: w.deployment_id,
-      deploymentUrl: w.deployment_url,
+      snapshotId: w.snapshot_id,
       functions: w.functions,
       status: w.status,
       errorMessage: w.error_message,
       createdAt: w.created_at,
+      snapshotExpiresAt: w.snapshot_expires_at,
+      lastInvokedAt: w.last_invoked_at,
+      expiresInDays: calculateExpiresInDays(w.snapshot_expires_at ? new Date(w.snapshot_expires_at) : null),
     })));
   } catch (error) {
     console.error('Error listing workers:', error);

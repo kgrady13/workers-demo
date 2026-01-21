@@ -5,9 +5,8 @@ import { useState, useEffect } from 'react';
 interface Worker {
   id: string;
   name: string;
-  deploymentId: string;
-  deploymentUrl: string;
-  status: 'building' | 'ready' | 'error';
+  snapshotId: string;
+  status: 'creating' | 'ready' | 'error' | 'expired';
   functions: string[];
   errorMessage: string | null;
 }
@@ -20,10 +19,11 @@ interface LogEntry {
 
 interface FunctionInvokerProps {
   worker: Worker;
-  onLogs?: (logs: LogEntry[]) => void;
+  onLog?: (log: LogEntry) => void;
+  onStreamingChange?: (isStreaming: boolean) => void;
 }
 
-export default function FunctionInvoker({ worker, onLogs }: FunctionInvokerProps) {
+export default function FunctionInvoker({ worker, onLog, onStreamingChange }: FunctionInvokerProps) {
   const [selectedFunction, setSelectedFunction] = useState('');
   const [payload, setPayload] = useState('{}');
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
@@ -49,6 +49,7 @@ export default function FunctionInvoker({ worker, onLogs }: FunctionInvokerProps
     setError(null);
     setResult(null);
     setDuration(null);
+    onStreamingChange?.(true);
 
     const startTime = Date.now();
 
@@ -60,31 +61,96 @@ export default function FunctionInvoker({ worker, onLogs }: FunctionInvokerProps
         throw new Error('Invalid JSON payload');
       }
 
-      const res = await fetch(`/api/workers/${worker.id}/functions/${selectedFunction}`, {
+      // Use SSE streaming for real-time logs
+      const res = await fetch(`/api/workers/${worker.id}/invoke/${selectedFunction}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+        },
         body: JSON.stringify(parsedPayload),
       });
 
-      const data = await res.json();
-      setDuration(Date.now() - startTime);
-
       if (!res.ok) {
-        throw new Error(data.error || 'Invocation failed');
+        const errorData = await res.json();
+        throw new Error(errorData.error || 'Invocation failed');
       }
 
-      setResult(data);
+      // Read SSE stream
+      const reader = res.body?.getReader();
+      if (!reader) {
+        throw new Error('No response body');
+      }
 
-      // Pass logs to parent if available
-      if (data.logs && onLogs) {
-        onLogs(data.logs);
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        let eventType = '';
+        let eventData = '';
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7);
+          } else if (line.startsWith('data: ')) {
+            eventData = line.slice(6);
+          } else if (line === '' && eventType && eventData) {
+            // Process complete event
+            try {
+              const data = JSON.parse(eventData);
+
+              if (eventType === 'log' && onLog) {
+                onLog({
+                  timestamp: data.timestamp,
+                  level: data.stream === 'stderr' ? 'error' : 'info',
+                  message: data.message,
+                });
+              } else if (eventType === 'result') {
+                setDuration(data.duration || (Date.now() - startTime));
+                setResult(data);
+              } else if (eventType === 'error') {
+                throw new Error(data.error);
+              }
+            } catch (e) {
+              if (e instanceof SyntaxError) {
+                console.error('Failed to parse SSE data:', eventData);
+              } else {
+                throw e;
+              }
+            }
+
+            eventType = '';
+            eventData = '';
+          }
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Invocation failed');
       setDuration(Date.now() - startTime);
     } finally {
       setIsInvoking(false);
+      onStreamingChange?.(false);
     }
+  }
+
+  if (worker.status === 'expired') {
+    return (
+      <div className="bg-white dark:bg-zinc-950 rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
+        <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100 mb-2">
+          Invoke Function
+        </h2>
+        <div className="flex items-center gap-2 text-zinc-500 dark:text-zinc-400">
+          <span className="text-amber-500">Worker snapshot has expired. Please redeploy.</span>
+        </div>
+      </div>
+    );
   }
 
   if (worker.status !== 'ready') {
@@ -94,13 +160,13 @@ export default function FunctionInvoker({ worker, onLogs }: FunctionInvokerProps
           Invoke Function
         </h2>
         <div className="flex items-center gap-2 text-zinc-500 dark:text-zinc-400">
-          {worker.status === 'building' && (
+          {worker.status === 'creating' && (
             <>
               <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
               </svg>
-              <span>Worker is building...</span>
+              <span>Worker is being created...</span>
             </>
           )}
           {worker.status === 'error' && (

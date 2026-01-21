@@ -4,7 +4,7 @@ import { useEffect, useRef } from 'react';
 
 interface Worker {
   id: string;
-  status: 'building' | 'ready' | 'error';
+  status: 'creating' | 'ready' | 'error' | 'expired';
 }
 
 interface LogEntry {
@@ -17,6 +17,7 @@ interface LogViewerProps {
   worker: Worker;
   logs: LogEntry[];
   onClear: () => void;
+  isStreaming?: boolean;
 }
 
 const levelColors: Record<string, string> = {
@@ -26,7 +27,7 @@ const levelColors: Record<string, string> = {
   info: 'text-blue-400',
 };
 
-export default function LogViewer({ worker, logs, onClear }: LogViewerProps) {
+export default function LogViewer({ worker, logs, onClear, isStreaming }: LogViewerProps) {
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -40,9 +41,17 @@ export default function LogViewer({ worker, logs, onClear }: LogViewerProps) {
   return (
     <div className="bg-white dark:bg-zinc-950 rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
-          Logs
-        </h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+            Logs
+          </h2>
+          {isStreaming && (
+            <span className="flex items-center gap-1.5 px-2 py-0.5 text-xs font-medium bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 rounded-full">
+              <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+              Streaming
+            </span>
+          )}
+        </div>
         <button
           onClick={onClear}
           className="px-3 py-1 text-sm bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-700 dark:text-zinc-300 rounded-md transition-colors"

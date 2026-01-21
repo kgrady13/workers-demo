@@ -12,15 +12,15 @@ function getDb() {
 export const db = {
   async createWorker(data: {
     name: string;
-    deploymentId: string;
-    deploymentUrl: string;
+    snapshotId: string;
     sourceCode: string;
     functions: string[];
+    snapshotExpiresAt: Date;
   }): Promise<Worker> {
     const sql = getDb();
     const result = await sql`
-      INSERT INTO workers (name, deployment_id, deployment_url, source_code, functions, status)
-      VALUES (${data.name}, ${data.deploymentId}, ${data.deploymentUrl}, ${data.sourceCode}, ${data.functions}, 'building')
+      INSERT INTO workers (name, snapshot_id, source_code, functions, status, snapshot_expires_at)
+      VALUES (${data.name}, ${data.snapshotId}, ${data.sourceCode}, ${data.functions}, 'ready', ${data.snapshotExpiresAt.toISOString()})
       RETURNING *
     `;
     return result[0] as Worker;
@@ -42,22 +42,33 @@ export const db = {
     return result as Worker[];
   },
 
-  async updateWorkerReady(id: string, deploymentUrl: string): Promise<Worker | null> {
+  async updateWorkerError(id: string, errorMessage: string): Promise<Worker | null> {
     const sql = getDb();
     const result = await sql`
       UPDATE workers
-      SET deployment_url = ${deploymentUrl}, status = 'ready'
+      SET status = 'error', error_message = ${errorMessage}
       WHERE id = ${id}
       RETURNING *
     `;
     return (result[0] as Worker) || null;
   },
 
-  async updateWorkerError(id: string, errorMessage: string): Promise<Worker | null> {
+  async updateWorkerExpired(id: string): Promise<Worker | null> {
     const sql = getDb();
     const result = await sql`
       UPDATE workers
-      SET status = 'error', error_message = ${errorMessage}
+      SET status = 'expired'
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    return (result[0] as Worker) || null;
+  },
+
+  async updateLastInvoked(id: string): Promise<Worker | null> {
+    const sql = getDb();
+    const result = await sql`
+      UPDATE workers
+      SET last_invoked_at = NOW()
       WHERE id = ${id}
       RETURNING *
     `;
@@ -79,21 +90,22 @@ export const db = {
     await sql`DROP TABLE IF EXISTS workers CASCADE`;
     await sql`DROP TABLE IF EXISTS tenants CASCADE`;
 
-    // Create simplified workers table
+    // Create simplified workers table with sandbox fields
     await sql`
       CREATE TABLE workers (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         name VARCHAR(255) NOT NULL,
-        deployment_id VARCHAR(255) NOT NULL,
-        deployment_url VARCHAR(512) NOT NULL,
+        snapshot_id VARCHAR(255) NOT NULL,
         functions TEXT[] DEFAULT '{}',
-        status VARCHAR(50) DEFAULT 'building' CHECK (status IN ('building', 'ready', 'error')),
+        status VARCHAR(50) DEFAULT 'creating' CHECK (status IN ('creating', 'ready', 'error', 'expired')),
         error_message TEXT,
         source_code TEXT NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        snapshot_expires_at TIMESTAMP WITH TIME ZONE,
+        last_invoked_at TIMESTAMP WITH TIME ZONE
       )
     `;
 
-    await sql`CREATE INDEX idx_workers_deployment_id ON workers(deployment_id)`;
+    await sql`CREATE INDEX idx_workers_snapshot_id ON workers(snapshot_id)`;
   }
 };
